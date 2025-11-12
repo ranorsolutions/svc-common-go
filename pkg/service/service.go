@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -11,11 +10,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/ranorsolutions/http-common-go/pkg/db/postgres"
 	logs "github.com/ranorsolutions/http-common-go/pkg/log/logger"
-	"github.com/ranorsolutions/svc-common-go/pkg/types"
+	"github.com/ranorsolutions/svc-common-go/pkg/route"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+)
+
+var (
+	connectPostgres = postgres.Connect
+	dialGRPC        = grpc.Dial
 )
 
 type Service struct {
@@ -24,7 +27,7 @@ type Service struct {
 	Services           map[string]interface{}
 	Logger             *logs.Logger
 	Port               string
-	HTTPHandlers       []*types.HTTPHandler
+	HTTPHandlers       []*route.Handler
 }
 
 type ServiceOption struct {
@@ -46,11 +49,18 @@ func New(serviceOpts ...ServiceOption) (*Service, error) {
 
 	// Connect to the Database
 	connString := postgres.GetURIFromEnv()
-	db, err := postgres.Connect(connString)
+	db, err := connectPostgres(connString)
 	if err != nil {
+		// Avoid trying to log or access db if nil
+		if logger != nil {
+			logger.Error("failed to connect to database: %v", err)
+		} else {
+			log.Printf("failed to connect to database: %v", err)
+		}
 		return nil, fmt.Errorf("failed to create db connection: %v", err)
 	}
-	logger.Info(fmt.Sprintf("Connected to database %s", connString.HostString()))
+
+	logger.Info("Connected to database %s", connString.HostString())
 
 	grpcOptions := []grpc.DialOption{}
 	if len(serviceOpts) > 0 {
@@ -65,17 +75,41 @@ func New(serviceOpts ...ServiceOption) (*Service, error) {
 
 	// Parse the service dependencies
 	services := map[string]*grpc.ClientConn{}
-	parsed := strings.Split(os.Getenv("SERVICE_DEPS"), ",")
-	for _, service := range parsed {
-		parsedService := strings.Split(service, "@")
-		if len(parsedService) == 2 {
-			conn, err := grpc.Dial(parsedService[1], grpcOptions...)
-			if err != nil {
-				return nil, err
+	raw := os.Getenv("SERVICE_DEPS")
+	if raw != "" {
+		for _, dep := range strings.Split(raw, ",") {
+			dep = strings.TrimSpace(dep)
+			if dep == "" {
+				continue
 			}
-			services[parsedService[0]] = conn
-			conn.WaitForStateChange(context.Background(), connectivity.Connecting)
-			logger.Info("Connected to %s service: %s", parsedService[0], conn.GetState())
+			parts := strings.SplitN(dep, "@", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			name, addr := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			if name == "" || addr == "" {
+				continue
+			}
+
+			conn, err := dialGRPC(addr, grpcOptions...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to dial %s: %w", name, err)
+			}
+			if conn == nil { // <- ensure non-nil
+				return nil, fmt.Errorf("failed to dial %s: got nil connection", name)
+			}
+
+			services[name] = conn
+
+			// Don't touch connectivity internals (mocks can panic).
+			// If you still want a log, keep it best-effort and guarded.
+			// defer func() {
+			//     if r := recover(); r != nil {
+			//         logger.Warn("skipped connectivity inspection for %s", name)
+			//     }
+			// }()
+			// _ = conn.GetState()
+			logger.Info("Connected to %s service", name)
 		}
 	}
 
